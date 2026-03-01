@@ -25,7 +25,13 @@
 #define MESH_MCAST_ADDR  "224.0.0.69"
 
 // ── Meshtastic – UART (fallback transport) ────────────────────────────────────
-// Connect a Meshtastic device via UART to these ESP32-S3 GPIO pins.
+// Connect a Meshtastic device via UART to these GPIO pins on the LOLIN S3 Mini.
+//
+// LOLIN S3 Mini pinout (both are on the left-side header, easily accessible):
+//   GPIO 16 = RX2   ← connect to Meshtastic TX pin
+//   GPIO 17 = TX2   ← connect to Meshtastic RX pin
+//   GND             ← common ground
+//
 // The wire protocol is the standard Meshtastic StreamInterface framing:
 //   0x94 0xC3 <uint16_be length> <protobuf bytes>
 #define MESH_UART_RX_PIN  16
