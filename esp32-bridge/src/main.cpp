@@ -151,11 +151,12 @@ void setup() {
 
     // 4. FreeRTOS tasks
     //    Priorities: 5 = high (BLE + MeshTX), 4 = normal (RX tasks), 2 = low (WiFi mgmt)
-    xTaskCreatePinnedToCore(BitchatBLE::bleTask,         "ble",      5120, nullptr, 5, nullptr, 0);
+    //    Stack sizes: BLE needs 8K for NimBLE connect/GATT; TX/RX tasks 6K for printf+protobuf.
+    xTaskCreatePinnedToCore(BitchatBLE::bleTask,         "ble",      8192, nullptr, 5, nullptr, 0);
     xTaskCreatePinnedToCore(wifiTask,                    "wifi",     4096, nullptr, 2, nullptr, 1);
-    xTaskCreatePinnedToCore(udpRxTask,                   "udp_rx",   4096, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(udpRxTask,                   "udp_rx",   6144, nullptr, 4, nullptr, 1);
     xTaskCreatePinnedToCore(MeshtasticUART::uartRxTask,  "uart_rx",  4096, nullptr, 4, nullptr, 1);
-    xTaskCreatePinnedToCore(meshTxTask,                  "mesh_tx",  4096, nullptr, 5, nullptr, 1);
+    xTaskCreatePinnedToCore(meshTxTask,                  "mesh_tx",  6144, nullptr, 5, nullptr, 1);
 
     Serial.println("[Boot] All tasks started – bridge is running");
 }

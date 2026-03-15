@@ -10,13 +10,14 @@
 #include <Arduino.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
+// Internal helpers – encoding
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Write a varint into buf.  Returns bytes written.
-static size_t writeVarint(uint8_t *buf, uint64_t val) {
+// Write a varint into buf[0..cap-1].  Returns bytes written, 0 on overflow.
+static size_t writeVarint(uint8_t *buf, size_t cap, uint64_t val) {
     size_t n = 0;
     do {
+        if (n >= cap) return 0;
         uint8_t b = val & 0x7Fu;
         val >>= 7;
         if (val) b |= 0x80u;
@@ -35,20 +36,29 @@ static size_t readVarint(const uint8_t *buf, size_t len, uint64_t &val) {
     return 0;  // truncated
 }
 
-// Write a varint field: tag + value.
-static size_t writeVarField(uint8_t *buf, uint32_t field_no, uint64_t val) {
+// Write a varint field: tag + value.  Returns bytes written, 0 on overflow.
+static size_t writeVarField(uint8_t *buf, size_t cap, uint32_t field_no, uint64_t val) {
     size_t n = 0;
-    n += writeVarint(buf + n, ((uint64_t)field_no << 3) | 0u);  // wire type 0
-    n += writeVarint(buf + n, val);
+    size_t adv = writeVarint(buf + n, cap - n, ((uint64_t)field_no << 3) | 0u);
+    if (!adv) return 0;
+    n += adv;
+    adv = writeVarint(buf + n, cap - n, val);
+    if (!adv) return 0;
+    n += adv;
     return n;
 }
 
-// Write a length-delimited field: tag + length + data.
-static size_t writeLenField(uint8_t *buf, uint32_t field_no,
+// Write a length-delimited field: tag + length + data.  Returns 0 on overflow.
+static size_t writeLenField(uint8_t *buf, size_t cap, uint32_t field_no,
                              const uint8_t *data, size_t data_len) {
     size_t n = 0;
-    n += writeVarint(buf + n, ((uint64_t)field_no << 3) | 2u);  // wire type 2
-    n += writeVarint(buf + n, data_len);
+    size_t adv = writeVarint(buf + n, cap - n, ((uint64_t)field_no << 3) | 2u);
+    if (!adv) return 0;
+    n += adv;
+    adv = writeVarint(buf + n, cap - n, data_len);
+    if (!adv) return 0;
+    n += adv;
+    if (n + data_len > cap) return 0;
     memcpy(buf + n, data, data_len);
     n += data_len;
     return n;
@@ -58,29 +68,47 @@ static size_t writeLenField(uint8_t *buf, uint32_t field_no,
 // Encoding
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Encode  Data { portnum, payload }  → buf.  Returns bytes written.
+// Encode  Data { portnum, payload }  → buf.  Returns bytes written, 0 on error.
 static size_t encodeData(const MeshData &d, uint8_t *buf, size_t buf_size) {
     size_t n = 0;
-    n += writeVarField(buf + n, 1, (uint64_t)d.portnum);           // field 1: portnum
-    if (d.payload_len > 0)
-        n += writeLenField(buf + n, 2, d.payload, d.payload_len);  // field 2: payload
+    size_t adv = writeVarField(buf + n, buf_size - n, 1, (uint64_t)d.portnum);
+    if (!adv) return 0;
+    n += adv;
+    if (d.payload_len > 0) {
+        adv = writeLenField(buf + n, buf_size - n, 2, d.payload, d.payload_len);
+        if (!adv) return 0;
+        n += adv;
+    }
     return n;
 }
 
 // Encode  MeshPacket { from, to, channel, decoded, id, hop_limit }  → buf.
 static size_t encodeMeshPacket(const MeshPacket &mp, uint8_t *buf, size_t buf_size) {
     size_t n = 0;
-    n += writeVarField(buf + n, 1, mp.from_id);    // field 1: from
-    n += writeVarField(buf + n, 2, mp.to_id);      // field 2: to
-    n += writeVarField(buf + n, 3, mp.channel);    // field 3: channel
+    size_t adv;
+
+    adv = writeVarField(buf + n, buf_size - n, 1, mp.from_id);
+    if (!adv) return 0; n += adv;
+
+    adv = writeVarField(buf + n, buf_size - n, 2, mp.to_id);
+    if (!adv) return 0; n += adv;
+
+    adv = writeVarField(buf + n, buf_size - n, 3, mp.channel);
+    if (!adv) return 0; n += adv;
 
     // field 4: decoded  (Data sub-message, length-delimited)
     uint8_t data_buf[280];
     size_t  data_len = encodeData(mp.decoded, data_buf, sizeof(data_buf));
-    n += writeLenField(buf + n, 4, data_buf, data_len);
+    if (data_len == 0) return 0;
+    adv = writeLenField(buf + n, buf_size - n, 4, data_buf, data_len);
+    if (!adv) return 0; n += adv;
 
-    n += writeVarField(buf + n, 6, mp.packet_id);  // field 6: id
-    n += writeVarField(buf + n, 9, mp.hop_limit);  // field 9: hop_limit
+    adv = writeVarField(buf + n, buf_size - n, 6, mp.packet_id);
+    if (!adv) return 0; n += adv;
+
+    adv = writeVarField(buf + n, buf_size - n, 9, mp.hop_limit);
+    if (!adv) return 0; n += adv;
+
     return n;
 }
 
@@ -95,7 +123,7 @@ size_t encodeToRadio(const MeshPacket &mp, uint8_t *buf, size_t buf_size) {
     if (needed > buf_size) return 0;
 
     // ToRadio { packet = field 1, length-delimited }
-    return writeLenField(buf, 1, pkt_buf, pkt_len);
+    return writeLenField(buf, buf_size, 1, pkt_buf, pkt_len);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +131,8 @@ size_t encodeToRadio(const MeshPacket &mp, uint8_t *buf, size_t buf_size) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Generic: skip over any field whose wire type we already know.
-// Returns bytes to skip past the value (NOT including the already-read tag).
+// Returns bytes to skip past the value (NOT including the already-read tag),
+// or 0 on error / truncation.
 static size_t skipField(const uint8_t *buf, size_t len, uint32_t wire_type) {
     if (wire_type == 0) {          // varint – consume bytes until MSB=0
         for (size_t i = 0; i < len; i++)
@@ -114,6 +143,7 @@ static size_t skipField(const uint8_t *buf, size_t len, uint32_t wire_type) {
         uint64_t flen = 0;
         size_t adv = readVarint(buf, len, flen);
         if (!adv) return 0;
+        if (adv + (size_t)flen > len) return 0;  // truncated payload
         return adv + (size_t)flen;
     }
     return 0;  // wire types 1,3,4,5 are not used by Meshtastic protobufs we care about
@@ -142,8 +172,11 @@ static void decodeData(const uint8_t *buf, size_t len, MeshData &d) {
             adv = readVarint(buf + i, len - i, flen);
             if (!adv) break;
             i += adv;
+            if (i + (size_t)flen > len) break;  // field extends past buffer
             if (fn == 2) {  // payload
-                uint16_t copy = (flen > sizeof(d.payload)) ? sizeof(d.payload) : (uint16_t)flen;
+                size_t remaining = len - i;
+                size_t avail = ((size_t)flen < remaining) ? (size_t)flen : remaining;
+                uint16_t copy = (avail > sizeof(d.payload)) ? sizeof(d.payload) : (uint16_t)avail;
                 memcpy(d.payload, buf + i, copy);
                 d.payload_len = copy;
             }
@@ -185,8 +218,10 @@ static void decodeMeshPacket(const uint8_t *buf, size_t len, MeshPacket &mp) {
             uint64_t flen = 0;
             adv = readVarint(buf + i, len - i, flen);
             if (!adv) break;
-            if (fn == 4) decodeData(buf + i + adv, (size_t)flen, mp.decoded);
-            i += adv + (size_t)flen;
+            i += adv;
+            if (i + (size_t)flen > len) break;  // sub-message extends past buffer
+            if (fn == 4) decodeData(buf + i, (size_t)flen, mp.decoded);
+            i += (size_t)flen;
         } else {
             size_t skip = skipField(buf + i, len - i, wt);
             if (!skip) break;
@@ -219,12 +254,14 @@ bool decodeFromRadio(const uint8_t *buf, size_t len, MeshPacket &out) {
             uint64_t flen = 0;
             adv = readVarint(buf + i, len - i, flen);
             if (!adv) break;
+            i += adv;
+            if (i + (size_t)flen > len) break;  // sub-message extends past buffer
             if (fn == 2) {  // field 2 = MeshPacket
-                decodeMeshPacket(buf + i + adv, (size_t)flen, out);
+                decodeMeshPacket(buf + i, (size_t)flen, out);
                 return out.decoded.portnum == PortNum::TEXT_MESSAGE
                     && out.decoded.payload_len > 0;
             }
-            i += adv + (size_t)flen;
+            i += (size_t)flen;
         } else {
             size_t skip = skipField(buf + i, len - i, wt);
             if (!skip) break;

@@ -11,6 +11,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
+#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -73,8 +74,9 @@ private:
     MessageBridge() = default;
 
     // ── Deduplication ring buffer ─────────────────────────────────────────────
-    bool isDuplicate(const uint8_t *id16);
-    void markSeen(const uint8_t *id16);
+    // Atomically checks whether id16 is known; if not, inserts it.
+    // Returns true if the ID was ALREADY seen (caller should drop the packet).
+    bool checkAndMark(const uint8_t *id16);
 
     uint8_t           _dedup[DEDUP_CACHE_SIZE][16];
     uint8_t           _dedup_head = 0;
@@ -91,6 +93,6 @@ private:
     // Encode a MeshPacket (ToRadio) into a heap-allocated BridgeMsg.
     static BridgeMsg *encodeMeshMsg(const MeshPacket &mp);
 
-    // Monotonically increasing counter for synthetic outgoing packet IDs.
-    uint32_t _seq = 0;
+    // Thread-safe monotonic counter for synthetic outgoing packet IDs.
+    std::atomic<uint32_t> _seq{0};
 };

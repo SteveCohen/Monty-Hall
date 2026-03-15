@@ -5,6 +5,9 @@
 #include "config.h"
 #include <Arduino.h>
 
+static constexpr uint8_t  BLE_CONNECT_TIMEOUT_S = 5;   // seconds
+static constexpr uint32_t PRUNE_INTERVAL_MS     = 2000; // rate-limit prunePeers()
+
 BitchatBLE &BitchatBLE::instance() {
     static BitchatBLE inst;
     return inst;
@@ -12,7 +15,7 @@ BitchatBLE &BitchatBLE::instance() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RX characteristic callback
-// A connected central wrote data to our RX characteristic → forward to bridge.
+// A connected central wrote data to our RX characteristic -> forward to bridge.
 // ─────────────────────────────────────────────────────────────────────────────
 void BitchatBLE::RxWriteCallback::onWrite(NimBLECharacteristic *c,
                                           NimBLEConnInfo &info) {
@@ -77,39 +80,51 @@ void BitchatBLE::onResult(NimBLEAdvertisedDevice *device) {
     std::string addrStr = device->getAddress().toString();
 
     xSemaphoreTake(_peersMtx, portMAX_DELAY);
-    bool already = (_peers.count(addrStr) > 0);
+    bool skip = (_peers.count(addrStr) > 0)
+             || (_pendingAddrs.count(addrStr) > 0)
+             || (_peers.size() + _pendingAddrs.size() >= MAX_BLE_PEERS);
+    if (!skip) _pendingAddrs.insert(addrStr);
     xSemaphoreGive(_peersMtx);
-    if (already) return;
-
-    // Guard: don't exceed the connection cap.
-    xSemaphoreTake(_peersMtx, portMAX_DELAY);
-    bool full = (_peers.size() >= MAX_BLE_PEERS);
-    xSemaphoreGive(_peersMtx);
-    if (full) return;
+    if (skip) return;
 
     NimBLEAddress addr = device->getAddress();
     Serial.printf("[BLE] Found bitchat device: %s\n", addrStr.c_str());
 
     // Post address to connection queue; the BLE task does the actual connect.
-    if (xQueueSend(connectQueue, &addr, 0) != pdTRUE)
+    if (xQueueSend(connectQueue, &addr, 0) != pdTRUE) {
         Serial.println("[BLE] connectQueue full");
+        // Remove from pending so future scans can retry.
+        xSemaphoreTake(_peersMtx, portMAX_DELAY);
+        _pendingAddrs.erase(addrStr);
+        xSemaphoreGive(_peersMtx);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Connect to a peer (called from bleTask, NOT from the scan callback)
 // ─────────────────────────────────────────────────────────────────────────────
 void BitchatBLE::connectToPeer(const NimBLEAddress &addr) {
+    std::string addrStr = addr.toString();
+
+    auto cleanup_pending = [&]() {
+        xSemaphoreTake(_peersMtx, portMAX_DELAY);
+        _pendingAddrs.erase(addrStr);
+        xSemaphoreGive(_peersMtx);
+    };
+
     NimBLEClient *pClient = NimBLEDevice::createClient(addr);
     if (!pClient) {
         Serial.println("[BLE] createClient failed");
+        cleanup_pending();
         return;
     }
     pClient->setConnectionParams(12, 24, 0, 400);
+    pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_S);
 
     if (!pClient->connect()) {
-        Serial.printf("[BLE] connect() to %s failed\n",
-                      addr.toString().c_str());
+        Serial.printf("[BLE] connect() to %s failed\n", addrStr.c_str());
         NimBLEDevice::deleteClient(pClient);
+        cleanup_pending();
         return;
     }
 
@@ -118,29 +133,38 @@ void BitchatBLE::connectToPeer(const NimBLEAddress &addr) {
         Serial.println("[BLE] bitchat service not found on peer");
         pClient->disconnect();
         NimBLEDevice::deleteClient(pClient);
+        cleanup_pending();
         return;
     }
 
-    // Subscribe to peer's TX characteristic (peer → us).
+    // Subscribe to peer's TX characteristic (peer -> us).
     NimBLERemoteCharacteristic *pTx = pSvc->getCharacteristic(BITCHAT_TX_UUID);
-    if (pTx && pTx->canNotify()) {
-        if (!pTx->subscribe(true, onPeerNotify, true))
-            Serial.println("[BLE] subscribe failed");
+    if (!pTx || !pTx->canNotify() || !pTx->subscribe(true, onPeerNotify, true)) {
+        Serial.println("[BLE] TX characteristic missing or subscribe failed - disconnecting");
+        pClient->disconnect();
+        NimBLEDevice::deleteClient(pClient);
+        cleanup_pending();
+        return;
     }
 
+    // Success: move from pending to connected.
     xSemaphoreTake(_peersMtx, portMAX_DELAY);
-    _peers[addr.toString()] = pClient;
+    _pendingAddrs.erase(addrStr);
+    _peers[addrStr] = pClient;
     size_t total = _peers.size();
     xSemaphoreGive(_peersMtx);
 
-    Serial.printf("[BLE] Connected to %s (%zu peer(s))\n",
-                  addr.toString().c_str(), total);
+    Serial.printf("[BLE] Connected to %s (%zu peer(s))\n", addrStr.c_str(), total);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Prune dropped connections
+// Prune dropped connections (rate-limited)
 // ─────────────────────────────────────────────────────────────────────────────
 void BitchatBLE::prunePeers() {
+    uint32_t now = millis();
+    if (now - _lastPruneMs < PRUNE_INTERVAL_MS) return;
+    _lastPruneMs = now;
+
     xSemaphoreTake(_peersMtx, portMAX_DELAY);
     for (auto it = _peers.begin(); it != _peers.end(); ) {
         if (!it->second->isConnected()) {
@@ -156,6 +180,9 @@ void BitchatBLE::prunePeers() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // broadcast()  –  send raw bitchat bytes to all reachable peers
+//
+// Takes a snapshot of the peer list under the mutex, then releases the mutex
+// before doing blocking BLE I/O.
 // ─────────────────────────────────────────────────────────────────────────────
 void BitchatBLE::broadcast(const uint8_t *data, uint16_t len) {
     // Notify connected centrals via our own TX characteristic.
@@ -164,17 +191,23 @@ void BitchatBLE::broadcast(const uint8_t *data, uint16_t len) {
         _txChar->notify();
     }
 
-    // Write to each peer's RX characteristic (us as central → peer as peripheral).
+    // Snapshot peer list to avoid holding the mutex during BLE write I/O.
+    std::vector<NimBLEClient *> snapshot;
     xSemaphoreTake(_peersMtx, portMAX_DELAY);
+    snapshot.reserve(_peers.size());
     for (auto &[addrStr, client] : _peers) {
-        if (!client->isConnected()) continue;
+        if (client->isConnected()) snapshot.push_back(client);
+    }
+    xSemaphoreGive(_peersMtx);
+
+    // Write to each peer's RX characteristic (us as central -> peer as peripheral).
+    for (NimBLEClient *client : snapshot) {
         NimBLERemoteService *svc = client->getService(BITCHAT_SVC_UUID);
         if (!svc) continue;
         NimBLERemoteCharacteristic *rx = svc->getCharacteristic(BITCHAT_RX_UUID);
         if (rx && rx->canWriteNoResponse())
             rx->writeValue(data, len, false);
     }
-    xSemaphoreGive(_peersMtx);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,7 +235,7 @@ void BitchatBLE::bleTask(void *arg) {
             delete msg;
         }
 
-        // ── Maintenance: prune dead connections ───────────────────────────────
+        // ── Maintenance: prune dead connections (rate-limited) ────────────────
         self.prunePeers();
     }
 }
@@ -246,8 +279,8 @@ void BitchatBLE::init() {
     NimBLEScan *scan = NimBLEDevice::getScan();
     scan->setAdvertisedDeviceCallbacks(this, false);
     scan->setActiveScan(true);
-    scan->setInterval(160);  // in 0.625ms units → 100ms
-    scan->setWindow(80);     //                  →  50ms (50% duty cycle)
+    scan->setInterval(160);  // in 0.625ms units -> 100ms
+    scan->setWindow(80);     //                  ->  50ms (50% duty cycle)
     startScan();
 }
 

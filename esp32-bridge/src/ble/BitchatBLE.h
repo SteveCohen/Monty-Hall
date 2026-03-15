@@ -3,15 +3,15 @@
 // BitchatBLE.h  –  NimBLE dual-role handler (Peripheral + Central)
 //
 // Peripheral role (GATT server):
-//   • Advertises with BITCHAT_SVC_UUID so bitchat devices can find the bridge.
-//   • Hosts TX characteristic (NOTIFY)  – bridge notifies connected peers.
-//   • Hosts RX characteristic (WRITE)   – connected peers write chat data here.
+//   Advertises with BITCHAT_SVC_UUID so bitchat devices can find the bridge.
+//   Hosts TX characteristic (NOTIFY)  – bridge notifies connected peers.
+//   Hosts RX characteristic (WRITE)   – connected peers write chat data here.
 //
 // Central role (scanner + client):
-//   • Continuously scans for devices advertising BITCHAT_SVC_UUID.
-//   • Connects to up to MAX_BLE_PEERS simultaneously.
-//   • Subscribes to each peer's TX characteristic for incoming chat messages.
-//   • Writes to each peer's RX characteristic to forward outgoing messages.
+//   Continuously scans for devices advertising BITCHAT_SVC_UUID.
+//   Connects to up to MAX_BLE_PEERS simultaneously.
+//   Subscribes to each peer's TX characteristic for incoming chat messages.
+//   Writes to each peer's RX characteristic to forward outgoing messages.
 //
 // NimBLE-Arduino v1.4.x API is assumed (h2zero/NimBLE-Arduino @ ^1.4.3).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -19,7 +19,9 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <map>
+#include <set>
 #include <string>
+#include <vector>
 #include "bridge/MessageBridge.h"
 #include "config.h"
 
@@ -70,7 +72,12 @@ private:
     // ── Connected peers (central role) ────────────────────────────────────────
     // Key = BLE address string, Value = connected NimBLEClient*
     std::map<std::string, NimBLEClient *> _peers;
+    // Addresses currently queued for connection (prevents double-connect).
+    std::set<std::string> _pendingAddrs;
     SemaphoreHandle_t _peersMtx = nullptr;
+
+    // Rate-limit prunePeers() to avoid thrashing every loop iteration.
+    uint32_t _lastPruneMs = 0;
 
     // ── RX characteristic callback (inner class) ──────────────────────────────
     // Invoked when a remote central writes chat data to our RX characteristic.

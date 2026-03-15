@@ -13,6 +13,10 @@ MeshtasticUDP &MeshtasticUDP::instance() {
 }
 
 bool MeshtasticUDP::init() {
+    // Tear down any stale socket from a previous WiFi session.
+    _udp.stop();
+    _ready = false;
+
     IPAddress mcast;
     if (!mcast.fromString(MESH_MCAST_ADDR)) {
         Serial.println("[UDP] Bad multicast address in config");

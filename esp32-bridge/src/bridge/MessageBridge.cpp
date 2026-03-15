@@ -20,25 +20,27 @@ void MessageBridge::init() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Deduplication
+// Deduplication – single atomic check-and-insert under one lock
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool MessageBridge::isDuplicate(const uint8_t *id16) {
+bool MessageBridge::checkAndMark(const uint8_t *id16) {
     xSemaphoreTake(_dedup_mtx, portMAX_DELAY);
+
+    // Search
     size_t count = _dedup_full ? DEDUP_CACHE_SIZE : _dedup_head;
     bool found = false;
     for (size_t i = 0; i < count && !found; i++)
         found = (memcmp(_dedup[i], id16, 16) == 0);
-    xSemaphoreGive(_dedup_mtx);
-    return found;
-}
 
-void MessageBridge::markSeen(const uint8_t *id16) {
-    xSemaphoreTake(_dedup_mtx, portMAX_DELAY);
-    memcpy(_dedup[_dedup_head], id16, 16);
-    _dedup_head = (_dedup_head + 1) % DEDUP_CACHE_SIZE;
-    if (_dedup_head == 0) _dedup_full = true;
+    // Insert if new
+    if (!found) {
+        memcpy(_dedup[_dedup_head], id16, 16);
+        _dedup_head = (_dedup_head + 1) % DEDUP_CACHE_SIZE;
+        if (_dedup_head == 0) _dedup_full = true;
+    }
+
     xSemaphoreGive(_dedup_mtx);
+    return found;  // true = duplicate, drop it
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,12 +49,11 @@ void MessageBridge::markSeen(const uint8_t *id16) {
 
 void MessageBridge::onBLEPacket(const BitchatPacket &pkt) {
     if (pkt.type != BITCHAT_TYPE_TEXT) return;
-    if (isDuplicate(pkt.id)) return;
-    markSeen(pkt.id);
+    if (checkAndMark(pkt.id)) return;
 
     MeshPacket mp;
     if (!bitchatToMesh(pkt, mp)) {
-        Serial.println("[Bridge] BLE→Mesh translation failed");
+        Serial.println("[Bridge] BLE->Mesh translation failed");
         return;
     }
 
@@ -60,7 +61,7 @@ void MessageBridge::onBLEPacket(const BitchatPacket &pkt) {
     if (!msg) return;
 
     if (xQueueSend(meshOutQueue, &msg, 0) != pdTRUE) {
-        Serial.println("[Bridge] meshOutQueue full – dropping");
+        Serial.println("[Bridge] meshOutQueue full - dropping");
         free(msg->data);
         delete msg;
     }
@@ -79,7 +80,7 @@ bool MessageBridge::bitchatToMesh(const BitchatPacket &bc, MeshPacket &out) {
 
     out.from_id   = NODE_ID;
     out.to_id     = 0xFFFFFFFFu;
-    out.packet_id = ++_seq;
+    out.packet_id = _seq.fetch_add(1, std::memory_order_relaxed) + 1;
     out.channel   = MESH_CHANNEL;
     out.hop_limit = 3;
 
@@ -87,7 +88,7 @@ bool MessageBridge::bitchatToMesh(const BitchatPacket &bc, MeshPacket &out) {
     memcpy(out.decoded.payload, bc.payload + txt_off, txt_len);
     out.decoded.payload_len = txt_len;
 
-    Serial.printf("[Bridge] BLE→Mesh  seq=%u  %.*s\n",
+    Serial.printf("[Bridge] BLE->Mesh  seq=%u  %.*s\n",
                   out.packet_id, txt_len, (char *)out.decoded.payload);
     return true;
 }
@@ -106,12 +107,11 @@ void MessageBridge::onMeshPacket(const MeshPacket &pkt) {
     memcpy(dedup_id + 4,  &pkt.from_id,  4);
     dedup_id[8] = 0xBE; dedup_id[9] = 0xEF;
 
-    if (isDuplicate(dedup_id)) return;
-    markSeen(dedup_id);
+    if (checkAndMark(dedup_id)) return;
 
     BitchatPacket bc;
     if (!meshToBitchat(pkt, bc)) {
-        Serial.println("[Bridge] Mesh→BLE translation failed");
+        Serial.println("[Bridge] Mesh->BLE translation failed");
         return;
     }
 
@@ -119,7 +119,7 @@ void MessageBridge::onMeshPacket(const MeshPacket &pkt) {
     if (!msg) return;
 
     if (xQueueSend(bleOutQueue, &msg, 0) != pdTRUE) {
-        Serial.println("[Bridge] bleOutQueue full – dropping");
+        Serial.println("[Bridge] bleOutQueue full - dropping");
         free(msg->data);
         delete msg;
     }
@@ -150,14 +150,14 @@ bool MessageBridge::meshToBitchat(const MeshPacket &mp, BitchatPacket &out) {
     p += 6;
 
     memcpy(p, &ts, 4); p += 4;
-    *p++ = 0;  // channel_len = 0 → empty channel name → "default"
+    *p++ = 0;  // channel_len = 0 -> empty channel name -> "default"
 
     memcpy(p, mp.decoded.payload, mp.decoded.payload_len);
     p += mp.decoded.payload_len;
 
     out.payload_len = (uint16_t)(p - out.payload);
 
-    Serial.printf("[Bridge] Mesh→BLE  from=0x%08X  %.*s\n",
+    Serial.printf("[Bridge] Mesh->BLE  from=0x%08X  %.*s\n",
                   mp.from_id,
                   mp.decoded.payload_len,
                   (char *)mp.decoded.payload);
@@ -169,8 +169,12 @@ bool MessageBridge::meshToBitchat(const MeshPacket &mp, BitchatPacket &out) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 BridgeMsg *MessageBridge::encodeBLEMsg(const BitchatPacket &pkt) {
-    uint16_t total = (uint16_t)(BITCHAT_HEADER_LEN + pkt.payload_len);
-    uint8_t *buf   = (uint8_t *)malloc(total);
+    if (pkt.payload_len > sizeof(pkt.payload)) return nullptr;  // sanity guard
+    uint32_t total32 = (uint32_t)BITCHAT_HEADER_LEN + pkt.payload_len;
+    if (total32 > 0xFFFFu) return nullptr;  // uint16_t overflow guard
+    uint16_t total = (uint16_t)total32;
+
+    uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) return nullptr;
 
     buf[0] = pkt.type;
@@ -178,7 +182,9 @@ BridgeMsg *MessageBridge::encodeBLEMsg(const BitchatPacket &pkt) {
     memcpy(buf + 2,                 pkt.id,      16);
     memcpy(buf + BITCHAT_HEADER_LEN, pkt.payload, pkt.payload_len);
 
-    return new BridgeMsg{buf, total};
+    BridgeMsg *msg = new (std::nothrow) BridgeMsg{buf, total};
+    if (!msg) { free(buf); return nullptr; }
+    return msg;
 }
 
 BridgeMsg *MessageBridge::encodeMeshMsg(const MeshPacket &mp) {
@@ -188,5 +194,7 @@ BridgeMsg *MessageBridge::encodeMeshMsg(const MeshPacket &mp) {
     size_t n = MeshProto::encodeToRadio(mp, buf, 512);
     if (n == 0) { free(buf); return nullptr; }
 
-    return new BridgeMsg{buf, (uint16_t)n};
+    BridgeMsg *msg = new (std::nothrow) BridgeMsg{buf, (uint16_t)n};
+    if (!msg) { free(buf); return nullptr; }
+    return msg;
 }
