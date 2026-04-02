@@ -1,5 +1,9 @@
+# DEPRECATED: Python 2 version of the Monty Hall simulation.
+# This file is kept for reference only. Do not use in new code.
+# See MontyHall.py for the current Python 3-compatible version.
+
 import random
-from decimal import Decimal
+from decimal import *
 
 class montyHall:
 	def __init__(self,rounds=500000):
@@ -19,21 +23,21 @@ class montyHall:
 		self.hostOpen=self.doors #Host will choose to remove one door from all the doors available..
 		for d in self.doors:
 			if (d==self.car) or (d==self.chosen): #Unless it's the car OR the one we chose.
-				self.hostOpen=list(filter(lambda a: a != d, self.hostOpen))
+				self.hostOpen=filter(lambda a: a != d, self.hostOpen)
 		self.hostOpen=random.choice(self.hostOpen)
 		if verbose: print ("Host chose %s" % self.hostOpen)
 
 
 		#Player chooses again (randomly), from one of the remaining doors:
-		self.playerChoice=list(filter(lambda a: a != self.hostOpen, self.doors))
+		self.playerChoice=filter(lambda a: a != self.hostOpen, self.doors)
 		self.playerChoice=random.choice(self.playerChoice)
 
 		#Record whether we changed or not, for purposes of scoring..
-		if self.playerChoice!=self.chosen:
-			if verbose: print("Player Changed")
+		if self.playerChoice<>self.chosen:
+			if verbose: print("Player Changed"),
 			changeStatus='changed'
 		else:
-			if verbose: print("Player No Change")
+			if verbose: print("Player No Change"),
 			changeStatus='not'
 
 		#Scoring
