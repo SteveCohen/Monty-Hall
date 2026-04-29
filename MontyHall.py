@@ -11,25 +11,24 @@ class montyHall:
 			self.run()
 
 	def run(self,verbose=False):
-		self.car=random.randint(1,3) #A car is behind a random door
-		self.chosen=random.randint(1,3) #We initially choose a random door.
-		if verbose: print ("Car: %s Chosen %s" % (self.car,self.chosen) )
+		car=random.randint(1,3) #A car is behind a random door
+		chosen=random.randint(1,3) #We initially choose a random door.
+		if verbose: print ("Car: %s Chosen %s" % (car,chosen))
 
 		#determine which door the host opens: not the chosen and not the car.
-		self.hostOpen=self.doors #Host will choose to remove one door from all the doors available..
+		hostOpen=list(self.doors) #Explicit copy so self.doors is never aliased or mutated.
 		for d in self.doors:
-			if (d==self.car) or (d==self.chosen): #Unless it's the car OR the one we chose.
-				self.hostOpen=list(filter(lambda a: a != d, self.hostOpen))
-		self.hostOpen=random.choice(self.hostOpen)
-		if verbose: print ("Host chose %s" % self.hostOpen)
-
+			if (d==car) or (d==chosen): #Unless it's the car OR the one we chose.
+				hostOpen=list(filter(lambda a: a != d, hostOpen))
+		hostOpen=random.choice(hostOpen)
+		if verbose: print ("Host chose %s" % hostOpen)
 
 		#Player chooses again (randomly), from one of the remaining doors:
-		self.playerChoice=list(filter(lambda a: a != self.hostOpen, self.doors))
-		self.playerChoice=random.choice(self.playerChoice)
+		playerChoice=list(filter(lambda a: a != hostOpen, self.doors))
+		playerChoice=random.choice(playerChoice)
 
-		#Record whether we changed or not, for purposes of scoring..
-		if self.playerChoice!=self.chosen:
+		#Record whether we changed or not, for purposes of scoring.
+		if playerChoice!=chosen:
 			if verbose: print("Player Changed")
 			changeStatus='changed'
 		else:
@@ -37,7 +36,7 @@ class montyHall:
 			changeStatus='not'
 
 		#Scoring
-		if self.playerChoice==self.car:
+		if playerChoice==car:
 			if verbose: print("WON!")
 			self.results[changeStatus]['won']+=1
 		else:
@@ -46,10 +45,15 @@ class montyHall:
 		if verbose: print("-------------")
 
 	def printScores(self):
-		stats={'change':0.0,'not':0.0}
-		stats['change']=Decimal(self.results['changed']['won'])/(Decimal(self.results['changed']['won'])+Decimal(self.results['changed']['lost']))
-		stats['not']=Decimal(self.results['not']['won'])/(Decimal(self.results['not']['won'])+Decimal(self.results['not']['lost']))
-		print("When changing, you win %.2f percent of the time. When not changing you win %.2f pct of the time" % (stats['change'],stats['not']))
+		for label,key in [('changing','changed'),('not changing','not')]:
+			won=self.results[key]['won']
+			lost=self.results[key]['lost']
+			total=won+lost
+			if total==0:
+				print("When %s: no data recorded." % label)
+			else:
+				pct=Decimal(won)/Decimal(total)
+				print("When %s, you win %.2f percent of the time." % (label,pct))
 
 if __name__=="__main__":
 	m=montyHall()
